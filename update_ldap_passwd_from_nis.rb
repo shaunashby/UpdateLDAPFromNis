@@ -87,7 +87,7 @@ class NIS
     end
 
     def to_s
-      return "Crypt{#{@passwd}}"
+      return "{CRYPT}#{@passwd}"
     end
   end
 
