@@ -12,11 +12,26 @@
 #--------------------------------------------------------------------
 
 require 'ldap'
+require 'ldap/ldif'
+
+# Generic Person class:
+class Person
+  def initialize(uid,password,dn)
+    @uid=uid
+    @password=password
+    @dn=dn
+  end
+
+  attr_reader :uid,:password,:dn
+
+  def to_s
+    return sprintf("%-20s %-25s  %-20s\n",@uid,@password,@dn);
+  end
+end
 
 class MyLDAP
   class People
-    def initialize(hostname='ashby.isdc.unige.ch')
-      @entries = Array::new
+    def initialize(hostname='ldap.isdc.unige.ch')
       begin
         @connection = LDAP::Conn.new(hostname, LDAP::LDAP_PORT)
         # Use protocol V3:
@@ -25,15 +40,26 @@ class MyLDAP
         print($stderr," ERROR trying to create LDAP connection: #{err}")
         exit(1)
       end
+      @entries = Hash::new()
     end
-    
+
     attr_reader :entries
-    
-    def search(base_dn,filter='(objectclass=person)',attrs=['uid','userPassword','gid'])
+
+    def search(base_dn='ou=People,dc=isdc,dc=unige,dc=ch',filter='(objectclass=person)')
       @connection.simple_bind(nil,nil)
       begin
-        @connection.search(base_dn,LDAP::LDAP_SCOPE_SUBTREE,filter,attrs) { |entry|
-          @entries << entry
+        @connection.search_ext2(base_dn,LDAP::LDAP_SCOPE_SUBTREE,filter) { |entry|
+          if !entry.nil?
+            password = nil
+            # Entry might not have a userPassword attribute:
+            if entry.has_key?('userPassword')
+              password = entry['userPassword'].to_s
+            end
+
+            @entries[entry['uid'].to_s] = Person::new(entry['uid'].to_s,
+                                                      password,
+                                                      entry['dn'].to_s)
+          end
         }
         @connection.unbind()
       rescue LDAP::ResultError => err
@@ -44,43 +70,47 @@ class MyLDAP
         exit(1)
       end
     end
+
+    def find_entry_for_uid(uid)
+      if @entries.has_key?(uid)
+        return @entries[uid]
+      end
+      return nil
+    end 
   end
 end
 
 class NIS
-  class PersonEntry
-    def initialize(username,password)
-      @username=username
-      @password=password
+  class Password
+    def initialize(passwd)
+      @passwd=passwd
     end
-    
-    attr_reader :username,:password
-    
+
     def to_s
-      return sprintf("%-40s  %-45s\n",@username,@password);
+      return "Crypt{#{@passwd}}"
     end
   end
-  
+
   class PasswordFile
     YPHOST='login'
     YPCAT='/usr/bin/ypcat'
     SSH='/usr/bin/ssh'
-    
+
     def initialize()
       @entries = Array::new
       self.get_entries
     end
-    
+
     attr_reader :entries
-    
+
     def get_entries
       query_command=sprintf("%s %s %s passwd",SSH,YPHOST,YPCAT)
       begin
         IO::popen(query_command) do |f|
           while line = f.gets
             line.chomp!
-            username, password, *rest = line.split(":")
-            @entries << PersonEntry::new(username,password)
+            uid, password,uidNumber,gid,fullname,*rest = line.split(":")
+            @entries << Person::new(uid,Password::new(password),fullname)
           end
         end  
       rescue => err
@@ -91,17 +121,35 @@ class NIS
   end
 end
 
-# Main:
-ldap_people = MyLDAP::People::new('ldap.isdc.unige.ch')
-ldap_people.search('ou=People,dc=isdc,dc=unige,dc=ch')
 
-for person in ldap_people.entries
-  puts person.dn
+
+#### Main ####
+ldap_people = MyLDAP::People::new()
+ldap_people.search()
+
+# Somewhere to store modifications:
+modifications=Array::new()
+
+NIS::PasswordFile::new().entries.each do |nis_user|
+  ldap_user = ldap_people.find_entry_for_uid(nis_user.uid)
+  if !ldap_user.nil?
+    if ldap_user.password.nil?
+      puts "Creating LDAP password entry for UID #{nis_user.uid}" if $DEBUG
+      # Add userPassword attribute:
+      modifications << Hash[ ldap_user.dn, LDAP.mod(LDAP::LDAP_MOD_ADD, 'userPassword', [ "#{nis_user.password}" ]) ]
+    else
+      if ldap_user.password != nis_user.password
+        puts "Synchronising NIS and LDAP password for UID #{nis_user.uid}" if $DEBUG
+        # Modify the value of the userPassword attribute for this uid:
+        modifications << Hash[ldap_user.dn,LDAP.mod(LDAP::LDAP_MOD_REPLACE, 'userPassword', [ "#{nis_user.password}" ])]
+      end
+    end
+  end
 end
 
-nis_passwd_file = NIS::PasswordFile::new()
-
-nis_passwd_file.entries.each do |nis_entry|
-  puts nis_entry
+# Dump out the changes as LDIF:
+modifications.each do |mod|
+  mod.each_pair do |dn,ldap_mod|
+    printf("%s\n",LDAP::LDIF.mods_to_ldif(dn,ldap_mod))
+  end
 end
-
